@@ -1,0 +1,467 @@
+-- lua/writers-crucible/init.lua
+-- Main plugin file
+
+local config = require("writers-crucible.config")
+local commands = require("writers-crucible.commands")
+local state = require("writers-crucible.state")
+local ui = require("writers-crucible.ui")
+
+local M = {}
+
+function M.setup(user_config)
+  config.setup(user_config)
+  commands.create_user_commands()
+
+  local group = vim.api.nvim_create_augroup("WritersCrucible", { clear = true })
+
+  vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
+    group = group,
+    pattern = config.get_tracked_filetypes_pattern(),
+    callback = function()
+      local buffer = vim.api.nvim_get_current_buf()
+      commands.handle_text_change(buffer)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd({ "BufEnter" }, {
+    group = group,
+    pattern = config.get_tracked_filetypes_pattern(),
+    callback = function()
+      local buffer = vim.api.nvim_get_current_buf()
+      state.initialize_for_buffer(buffer)
+      ui.update_statusline()
+    end,
+  })
+end
+
+return M
+```
+
+```lua
+-- lua/writers-crucible/config.lua
+-- Handles plugin configuration.
+
+local M = {}
+
+local defaults = {
+  tracked_filetypes = { "markdown", "text", "latex" },
+  undo_grace_period = 30, -- in seconds
+  max_tracked_chars = 50,
+}
+
+M.options = {}
+
+function M.setup(user_config)
+  M.options = vim.tbl_deep_extend("force", defaults, user_config or {})
+end
+
+function M.get_tracked_filetypes_pattern()
+  return "*." .. table.concat(M.options.tracked_filetypes, ",*.")
+end
+
+return M
+```
+
+```lua
+-- lua/writers-crucible/state.lua
+-- Manages the state of the writing challenges.
+
+local M = {}
+
+local current_state = {}
+local last_character_count = 0
+
+local function get_state_file_path()
+  return vim.fn.getcwd() .. "/.writers_crucible.json"
+end
+
+function M.load_state()
+  local path = get_state_file_path()
+  local file = io.open(path, "r")
+  if not file then
+    return {
+      goal = 0,
+      dailyCount = 0,
+      lastUpdateDate = os.date("%Y-%m-%d"),
+      challengeName = "No Challenge Set",
+      history = {},
+      pendingChars = {},
+      trackingPaused = false,
+    }
+  end
+  local content = file:read("*a")
+  file:close()
+  local state_data, _ = vim.json.decode(content)
+  return state_data
+end
+
+function M.save_state(state_data)
+  local path = get_state_file_path()
+  local file = io.open(path, "w")
+  if not file then
+    vim.notify("Error saving Writer's Crucible state.", vim.log.levels.ERROR)
+    return
+  end
+  file:write(vim.json.encode(state_data))
+  file:close()
+end
+
+function M.check_date_and_reset(state_data)
+  local today = os.date("%Y-%m-%d")
+  if state_data.lastUpdateDate ~= today then
+    if state_data.dailyCount > 0 then
+      table.insert(state_data.history, {
+        date = state_data.lastUpdateDate,
+        count = state_data.dailyCount,
+      })
+    end
+    state_data.dailyCount = 0
+    state_data.lastUpdateDate = today
+    vim.notify("A new day has begun! Your character count has been reset.")
+  end
+  return state_data
+end
+
+function M.initialize_for_buffer(buffer)
+  current_state = M.load_state()
+  current_state = M.check_date_and_reset(current_state)
+  M.save_state(current_state)
+  last_character_count = vim.api.nvim_buf_line_count(buffer) > 0 and vim.api.nvim_buf_get_offset(buffer, vim.api.nvim_buf_line_count(buffer) - 1) or 0
+end
+
+function M.get_current_state()
+  return current_state
+end
+
+function M.get_last_character_count()
+    return last_character_count
+end
+
+function M.set_last_character_count(count)
+    last_character_count = count
+end
+
+return M
+```
+
+```lua
+-- lua/writers-crucible/commands.lua
+-- Defines user commands and their logic.
+
+local state = require("writers-crucible.state")
+local config = require("writers-crucible.config")
+local ui = require("writers-crucible.ui")
+
+local M = {}
+
+local function update_daily_count(amount)
+  local current_state = state.get_current_state()
+  local old_count = current_state.dailyCount
+  current_state.dailyCount = current_state.dailyCount + amount
+
+  if current_state.goal > 0 and old_count < current_state.goal and current_state.dailyCount >= current_state.goal then
+    vim.notify("🎉 Goal Complete! You've written " .. current_state.dailyCount .. " characters today. Well done!")
+  end
+
+  state.save_state(current_state)
+  ui.update_statusline()
+end
+
+function M.handle_text_change(buffer)
+  local current_state = state.get_current_state()
+  if current_state.trackingPaused then
+    return
+  end
+
+  local new_char_count = vim.api.nvim_buf_line_count(buffer) > 0 and vim.api.nvim_buf_get_offset(buffer, vim.api.nvim_buf_line_count(buffer) - 1) or 0
+  local last_char_count = state.get_last_character_count()
+  local diff = new_char_count - last_char_count
+
+  if diff > 0 then
+    -- Addition
+    local chars_to_track = math.min(diff, config.options.max_tracked_chars)
+    table.insert(current_state.pendingChars, {
+      count = chars_to_track,
+      timestamp = os.time(),
+    })
+  elseif diff < 0 then
+    -- Deletion
+    local chars_to_delete = -diff
+    while chars_to_delete > 0 and #current_state.pendingChars > 0 do
+      local last_addition = current_state.pendingChars[#current_state.pendingChars]
+      if os.time() - last_addition.timestamp < config.options.undo_grace_period then
+        if last_addition.count > chars_to_delete then
+          last_addition.count = last_addition.count - chars_to_delete
+          chars_to_delete = 0
+        else
+          chars_to_delete = chars_to_delete - last_addition.count
+          table.remove(current_state.pendingChars)
+        end
+      else
+        break
+      end
+    end
+  end
+
+  state.set_last_character_count(new_char_count)
+  state.save_state(current_state)
+  ui.update_statusline()
+end
+
+local function commit_pending_chars()
+  local current_state = state.get_current_state()
+  local now = os.time()
+  local committed_count = 0
+  local still_pending = {}
+
+  for _, entry in ipairs(current_state.pendingChars) do
+    if now - entry.timestamp > config.options.undo_grace_period then
+      committed_count = committed_count + entry.count
+    else
+      table.insert(still_pending, entry)
+    end
+  end
+
+  if committed_count > 0 then
+    update_daily_count(committed_count)
+    current_state.pendingChars = still_pending
+    state.save_state(current_state)
+  end
+end
+
+local function start_challenge()
+  local challenges = {
+    { "Micro-Sprint: 500 characters/day", 500 },
+    { "Standard Kilo-Challenge: 1,000 characters/day", 1000 },
+    { "Marathoner's Pace: 2,000 characters/day", 2000 },
+    { "3K Crucible: 3,000 characters/day", 3000 },
+    { "Custom Challenge", "custom" },
+  }
+  local choices = {}
+  for _, c in ipairs(challenges) do
+    table.insert(choices, c[1])
+  end
+
+  vim.ui.select(choices, { prompt = "Choose your daily writing challenge:" }, function(choice)
+    if not choice then
+      return
+    end
+    local selected_challenge
+    for _, c in ipairs(challenges) do
+      if c[1] == choice then
+        selected_challenge = c
+        break
+      end
+    end
+
+    local current_state = state.load_state()
+    if selected_challenge[2] == "custom" then
+      vim.ui.input({ prompt = "Enter your daily character goal:" }, function(input)
+        if not input then
+          return
+        end
+        local goal = tonumber(input)
+        if goal and goal > 0 then
+          current_state.goal = goal
+          current_state.challengeName = "Custom Challenge (" .. goal .. " chars/day)"
+          state.save_state(current_state)
+          vim.notify("Challenge Started: " .. current_state.challengeName)
+          ui.update_statusline()
+        else
+          vim.notify("Invalid goal.", vim.log.levels.ERROR)
+        end
+      end)
+    else
+      current_state.goal = selected_challenge[2]
+      current_state.challengeName = selected_challenge[1]
+      state.save_state(current_state)
+      vim.notify("Challenge Started: " .. current_state.challengeName)
+      ui.update_statusline()
+    end
+  end)
+end
+
+local function show_stats()
+  local current_state = state.load_state()
+  local stats_content = {
+    "Writer's Crucible Statistics",
+    "============================",
+    "Project: " .. vim.fn.fnamemodify(vim.fn.getcwd(), ":t"),
+    "Current Challenge: " .. current_state.challengeName,
+    "",
+    "Lifetime Statistics",
+    "-------------------",
+    "Total Characters Written: " .. tostring(current_state.dailyCount),
+    "Total Writing Days: " .. tostring(#current_state.history + 1),
+    "",
+    "Daily History",
+    "-------------",
+  }
+  for _, h in ipairs(current_state.history) do
+    table.insert(stats_content, h.date .. ": " .. h.count .. " characters")
+  end
+  ui.show_in_floating_window(stats_content)
+end
+
+local function reset_today()
+  vim.ui.confirm("Are you sure you want to reset today's character count?", function(confirmed)
+    if confirmed then
+      local current_state = state.get_current_state()
+      current_state.dailyCount = 0
+      state.save_state(current_state)
+      ui.update_statusline()
+      vim.notify("Today's character count has been reset.")
+    end
+  end)
+end
+
+local function reset_all()
+    vim.ui.confirm("Are you sure you want to reset all data for this project?", function(confirmed)
+        if confirmed then
+            state.save_state({
+                goal = 0,
+                dailyCount = 0,
+                lastUpdateDate = os.date("%Y-%m-%d"),
+                challengeName = "No Challenge Set",
+                history = {},
+                pendingChars = {},
+                trackingPaused = false,
+            })
+            ui.update_statusline()
+            vim.notify("All data for this project has been reset.")
+        end
+    end)
+end
+
+local function pause_tracking()
+    local current_state = state.get_current_state()
+    current_state.trackingPaused = true
+    state.save_state(current_state)
+    ui.update_statusline()
+    vim.notify("Writer's Crucible tracking paused.")
+end
+
+local function resume_tracking()
+    local current_state = state.get_current_state()
+    current_state.trackingPaused = false
+    state.save_state(current_state)
+    ui.update_statusline()
+    vim.notify("Writer's Crucible tracking resumed.")
+end
+
+local function correct_count()
+    vim.ui.input({ prompt = "Enter the number of characters to subtract:" }, function(input)
+        if not input then return end
+        local correction = tonumber(input)
+        if correction and correction > 0 then
+            local current_state = state.get_current_state()
+            current_state.dailyCount = math.max(0, current_state.dailyCount - correction)
+            state.save_state(current_state)
+            ui.update_statusline()
+            vim.notify("Character count corrected.")
+        else
+            vim.notify("Invalid number.", vim.log.levels.ERROR)
+        end
+    end)
+end
+
+local function add_revision_time()
+    local current_state = state.get_current_state()
+    if current_state.goal >= 3000 then
+        update_daily_count(1000)
+        vim.notify("1,000 characters added for revision time.")
+    else
+        vim.notify("This command is for challenges of 3,000+ characters.", vim.log.levels.WARN)
+    end
+end
+
+local function add_citation()
+    local current_state = state.get_current_state()
+    if current_state.goal >= 2000 then
+        update_daily_count(50)
+        vim.notify("50 characters added for a citation.")
+    else
+        vim.notify("This command is for challenges of 2,000+ characters.", vim.log.levels.WARN)
+    end
+end
+
+function M.create_user_commands()
+  vim.api.nvim_create_user_command("WritersCrucible", start_challenge, {})
+  vim.api.nvim_create_user_command("WritersCrucibleStats", show_stats, {})
+  vim.api.nvim_create_user_command("WritersCrucibleResetToday", reset_today, {})
+  vim.api.nvim_create_user_command("WritersCrucibleReset", reset_all, {})
+  vim.api.nvim_create_user_command("WritersCruciblePause", pause_tracking, {})
+  vim.api.nvim_create_user_command("WritersCrucibleResume", resume_tracking, {})
+  vim.api.nvim_create_user_command("WritersCrucibleCorrectCount", correct_count, {})
+  vim.api.nvim_create_user_command("WritersCrucibleAddRevisionTime", add_revision_time, {})
+  vim.api.nvim_create_user_command("WritersCrucibleAddCitation", add_citation, {})
+
+  -- Timer to commit pending characters
+  vim.fn.timer_start(5000, function()
+    commit_pending_chars()
+  end, { ["repeat"] = -1 })
+end
+
+return M
+```
+
+```lua
+-- lua/writers-crucible/ui.lua
+-- Handles UI elements like the statusline and floating windows.
+
+local state = require("writers-crucible.state")
+
+local M = {}
+
+function M.update_statusline()
+  -- This is a bit of a hack to force statusline refresh.
+  -- A better approach is to use the statusline component directly.
+  vim.cmd("redraws!")
+end
+
+function M.statusline_component()
+  local current_state = state.get_current_state()
+  if not current_state or not current_state.goal or current_state.goal == 0 then
+    return "✍️ No Challenge"
+  end
+
+  local pending_total = 0
+  for _, entry in ipairs(current_state.pendingChars) do
+    pending_total = pending_total + entry.count
+  end
+  local display_count = current_state.dailyCount + pending_total
+
+  local percentage = math.floor((display_count / current_state.goal) * 100)
+  local text = string.format("✍️ %d/%d (%d%%)", display_count, current_state.goal, percentage)
+
+  if current_state.trackingPaused then
+    text = text .. " (Paused)"
+  end
+
+  return text
+end
+
+function M.show_in_floating_window(content)
+  local width = 80
+  local height = 20
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, content)
+
+  local win_width = vim.api.nvim_get_option("columns")
+  local win_height = vim.api.nvim_get_option("lines")
+  local win_col = math.floor((win_width - width) / 2)
+  local win_row = math.floor((win_height - height) / 2)
+
+  local opts = {
+    style = "minimal",
+    relative = "editor",
+    width = width,
+    height = height,
+    col = win_col,
+    row = win_row,
+    border = "rounded",
+  }
+  vim.api.nvim_open_win(buf, true, opts)
+end
+
+return M
