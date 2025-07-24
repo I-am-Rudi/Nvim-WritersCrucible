@@ -1,5 +1,7 @@
 # Writer's Crucible for Neovim
 
+**THIS APPLICATION IS STILL NOT FULLY TESTED**
+
 **Writer's Crucible for Neovim** is a port of the [Writer's Crucible VS Code extension](https://marketplace.visualstudio.com/items?itemName=I-am-Rudi.writers-crucible). It helps writers maintain momentum by tracking daily writing challenges directly within Neovim.
 
 This plugin lives in your statusline, providing at-a-glance feedback on your progress without interrupting your workflow.
